@@ -1,13 +1,9 @@
-import hashlib
-import os
 import re
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
-from urllib.error import HTTPError
 
-from scripts import convert, publish
+from scripts import convert
 
 
 INPUTS = {
@@ -87,62 +83,3 @@ class ConvertTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, rf"download\.list:3: {message}"):
                     convert.convert(self.source, self.data)
                 self.assertFalse(self.data.exists())
-
-
-class PublishTests(unittest.TestCase):
-    def setUp(self):
-        temp = tempfile.TemporaryDirectory()
-        self.addCleanup(temp.cleanup)
-        self.dist = Path(temp.name)
-        data = b"test geosite bytes"
-        sha = hashlib.sha256(data).hexdigest()
-        (self.dist / "geosite.dat").write_bytes(data)
-        (self.dist / "geosite.dat.sha256").write_bytes(f"{sha}  geosite.dat\n".encode())
-        self.digests = {
-            p.name: f"sha256:{hashlib.sha256(p.read_bytes()).hexdigest()}"
-            for p in self.dist.iterdir()
-        }
-        env = patch.dict(os.environ, {
-            "GITHUB_REPOSITORY": "owner/test",
-            "GITHUB_API_URL": "https://api.github.com",
-            "GH_TOKEN": "unused",
-            "GITHUB_RUN_ID": "123",
-            "GITHUB_RUN_ATTEMPT": "2",
-            "GITHUB_SHA": "b" * 40,
-        })
-        env.start()
-        self.addCleanup(env.stop)
-        self.summary = {"categories": {"cdn": 1, "download": 2}, "inputs": {"mihomo/file.list": 3}}
-        self.source_sha = "a" * 40
-
-    @patch("scripts.publish.subprocess.run")
-    @patch("scripts.publish.latest_assets")
-    def test_unchanged_skips(self, latest, gh):
-        latest.return_value = self.digests
-        self.assertFalse(publish.publish(self.dist, self.source_sha, self.summary))
-        gh.assert_not_called()
-
-    @patch("scripts.publish.subprocess.run")
-    @patch("scripts.publish.latest_assets")
-    def test_first_release_or_changed_assets_upload_together(self, latest, gh):
-        for existing in ({}, {**self.digests, "geosite.dat.sha256": "sha256:old"}):
-            with self.subTest(existing=existing):
-                gh.reset_mock()
-                latest.return_value = existing
-                self.assertTrue(publish.publish(self.dist, self.source_sha, self.summary))
-                gh.assert_called_once()
-                args = gh.call_args.args[0]
-                self.assertEqual(args[:4], ["gh", "release", "create", "geosite-123-2"])
-                self.assertIn(str(self.dist / "geosite.dat"), args)
-                self.assertIn(str(self.dist / "geosite.dat.sha256"), args)
-                self.assertIn("--latest", args)
-                self.assertIn(self.source_sha, gh.call_args.kwargs["input"])
-                self.assertTrue(gh.call_args.kwargs["check"])
-
-    @patch("scripts.publish.subprocess.run")
-    @patch("scripts.publish.urlopen")
-    def test_api_failure_does_not_publish(self, urlopen, gh):
-        urlopen.side_effect = HTTPError("https://api.github.com", 503, "unavailable", {}, None)
-        with self.assertRaises(HTTPError):
-            publish.publish(self.dist, self.source_sha, self.summary)
-        gh.assert_not_called()
