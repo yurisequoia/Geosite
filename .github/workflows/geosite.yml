@@ -71,14 +71,18 @@ jobs:
           go run -mod=readonly ./ --datapath="$BUILD_DIR/data" --outputdir="$BUILD_DIR/dist" --outputname=geosite.dat
           test -s "$BUILD_DIR/dist/geosite.dat"
 
-      - name: Write the checksum
+      - name: Write the checksum and release metadata
+        id: release
         run: |
+          rules_sha=$(git -C .work/rules rev-parse HEAD)
+          tag=$(TZ=Asia/Hong_Kong date '+geosite-%Y-%m-%d-%H%M%S')
           cd "$BUILD_DIR/dist"
           sha256sum geosite.dat > geosite.dat.sha256
+          read -r data_digest _ < geosite.dat.sha256
           cat geosite.dat.sha256
+          printf 'tag=%s\nsource_sha=%s\ndata_digest=%s\n' "$tag" "$rules_sha" "$data_digest" >> "$GITHUB_OUTPUT"
 
       - name: Publish GitHub Release
-        if: steps.release.outputs.tag != ''
         uses: softprops/action-gh-release@v3.0.4
         with:
           tag_name: ${{ steps.release.outputs.tag }}
