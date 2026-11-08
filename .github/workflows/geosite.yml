@@ -1,0 +1,102 @@
+name: Build Xray GeoSite
+
+on:
+  schedule:
+    - cron: "0 10 * * *"
+      timezone: "Asia/Shanghai"
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish a release if the assets have changed
+        type: boolean
+        default: false
+
+concurrency:
+  group: geosite-release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  geosite:
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-slim
+    timeout-minutes: 15
+    env:
+      GOTOOLCHAIN: local
+    steps:
+      - name: Check out this repository
+        uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check out the rule snapshot
+        uses: actions/checkout@v7.0.1
+        with:
+          repository: yurisequoia/Rules
+          ref: refs/heads/master
+          path: .work/rules
+          persist-credentials: false
+
+      - name: Check out the GeoSite builder
+        uses: actions/checkout@v7.0.1
+        with:
+          repository: v2fly/domain-list-community
+          ref: refs/heads/master
+          path: .work/dlc
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@v7.0.0
+        with:
+          go-version-file: .work/dlc/go.mod
+          cache: false
+
+      - name: Test the scripts
+        run: python3 -B -m unittest discover -s tests -v
+
+      - name: Prepare the build directory
+        run: |
+          mkdir -p "$RUNNER_TEMP/geosite/dist"
+          echo "BUILD_DIR=$RUNNER_TEMP/geosite" >> "$GITHUB_ENV"
+
+      - name: Convert rule lists
+        run: |
+          git -C .work/rules rev-parse HEAD
+          python3 scripts/convert.py --source .work/rules/mihomo --output "$BUILD_DIR/data" > "$BUILD_DIR/summary.json"
+
+      - name: Build geosite.dat
+        working-directory: .work/dlc
+        run: |
+          go run -mod=readonly ./ --datapath="$BUILD_DIR/data" --outputdir="$BUILD_DIR/dist" --outputname=geosite.dat
+          test -s "$BUILD_DIR/dist/geosite.dat"
+
+      - name: Write the checksum
+        run: |
+          cd "$BUILD_DIR/dist"
+          sha256sum geosite.dat > geosite.dat.sha256
+          cat geosite.dat.sha256
+
+      - name: Publish GitHub Release
+        if: steps.release.outputs.tag != ''
+        uses: softprops/action-gh-release@v3.0.4
+        with:
+          tag_name: ${{ steps.release.outputs.tag }}
+          name: ${{ steps.release.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          make_latest: "true"
+          generate_release_notes: false
+          fail_on_unmatched_files: true
+          overwrite_files: false
+          working_directory: ${{ env.BUILD_DIR }}/dist
+          files: |
+            geosite.dat
+            geosite.dat.sha256
+          body: |
+            - 源规则提交：[`${{ steps.release.outputs.source_sha }}`](https://github.com/yurisequoia/Rules/commit/${{ steps.release.outputs.source_sha }})
+            - SHA-256：`${{ steps.release.outputs.data_digest }}`
