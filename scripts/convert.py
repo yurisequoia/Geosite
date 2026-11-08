@@ -1,85 +1,115 @@
+"""Convert the five Rules/mihomo lists into two domain-list-community inputs."""
+
+import argparse
+import json
 import re
-import tempfile
-import unittest
 from pathlib import Path
 
-from scripts import convert
 
-
-INPUTS = {
-    "domainset/cdn.list": "exact.example\n+.suffix.example\n",
-    "non_ip/cdn.list": "DOMAIN,EXACT.example\nDOMAIN-KEYWORD,-assets.example\n",
-    "non_ip/microsoft_cdn.list": "DOMAIN-SUFFIX,ms.example\n",
-    "domainset/download.list": "+.suffix.example\ninstaller.example\n",
-    "non_ip/download.list": "DOMAIN-WILDCARD,cdn.*.example.net\nDOMAIN-WILDCARD,ftp.??.example.net\n",
+SOURCES = {
+    "cdn": ("domainset/cdn.list", "non_ip/cdn.list", "non_ip/microsoft_cdn.list"),
+    "download": ("domainset/download.list", "non_ip/download.list"),
 }
+TYPES = {
+    "DOMAIN": "full",
+    "DOMAIN-SUFFIX": "domain",
+    "DOMAIN-KEYWORD": "keyword",
+    "DOMAIN-WILDCARD": "regexp",
+}
+LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
+KEYWORD = re.compile(r"[a-z0-9._-]+")
+WILDCARD = re.compile(r"[a-z0-9.*?-]+")
+GLOB_TO_REGEX = {".": r"\.", "*": ".*", "?": "."}
 
 
-class ConvertTests(unittest.TestCase):
-    def setUp(self):
-        temp = tempfile.TemporaryDirectory()
-        self.addCleanup(temp.cleanup)
-        self.root = Path(temp.name)
-        self.source = self.root / "mihomo"
-        self.data = self.root / "data"
-        for path, content in INPUTS.items():
-            file = self.source / path
-            file.parent.mkdir(parents=True, exist_ok=True)
-            file.write_text("# Last Update: yesterday\n\n" + content, encoding="utf-8-sig")
+def convert_line(line: str, domainset: bool) -> str:
+    if domainset:
+        if line.startswith("+."):
+            kind, value = "domain", line[2:]
+        else:
+            kind, value = "full", line
+    else:
+        fields = line.split(",")
+        if len(fields) != 2:
+            raise ValueError("expected exactly RULE-TYPE,value")
+        rule, value = (field.strip() for field in fields)
+        if rule not in TYPES:
+            raise ValueError(f"unsupported rule type: {rule!r}")
+        kind = TYPES[rule]
 
-    def test_categories_and_determinism(self):
-        counts = convert.convert(self.source, self.data)
-        self.assertEqual(counts["categories"], {"cdn": 4, "download": 4})
-        cdn = (self.data / "cdn").read_text(encoding="utf-8").splitlines()
-        self.assertEqual(cdn, [
-            "domain:ms.example", "domain:suffix.example", "full:exact.example",
-            "keyword:-assets.example",
-        ])
-        self.assertIn("domain:suffix.example", (self.data / "download").read_text())
-        path = self.source / "domainset/cdn.list"
-        path.write_text("# Last Update: today\n+.suffix.example\nexact.example\n", encoding="utf-8")
-        other = self.root / "another"
-        self.assertEqual(convert.convert(self.source, other), counts)
-        for tag in counts["categories"]:
-            self.assertEqual((self.data / tag).read_bytes(), (other / tag).read_bytes())
+    if not value.isascii():
+        raise ValueError(f"expected an ASCII domain or pattern: {value!r}")
+    value = value.lower()
+    if kind in {"full", "domain"}:
+        if len(value) > 253 or not all(LABEL.fullmatch(label) for label in value.split(".")):
+            raise ValueError(f"invalid domain: {value!r}")
+    elif kind == "keyword":
+        if not KEYWORD.fullmatch(value):
+            raise ValueError(f"invalid keyword: {value!r}")
+    elif kind == "regexp":
+        if not WILDCARD.fullmatch(value):
+            raise ValueError(f"invalid domain wildcard: {value!r}")
+        value = "^" + "".join(GLOB_TO_REGEX.get(c, c) for c in value) + "$"
+    return f"{kind}:{value}"
 
-    def test_wildcard_matching(self):
-        cases = [
-            ("cdn.*.example.net", ("cdn.a.example.net", "cdn.a.b.example.net"),
-             ("mycdn.a.example.net", "cdn.a.example.net.evil", "cdn.a.exampleXnet")),
-            ("cdn-*.example.net", ("cdn-.example.net", "cdn-east.example.net"),
-             ("cdn.example.net", "cdn-east.example.org")),
-            ("ftp.??.example.net", ("ftp.hk.example.net",),
-             ("ftp.h.example.net", "ftp.hkg.example.net", "ftp.hk.example.net.evil")),
-        ]
-        for pattern, hits, misses in cases:
-            _, regex = convert.convert_line("DOMAIN-WILDCARD," + pattern, False).split(":", 1)
-            for host in hits + misses:
-                with self.subTest(host=host, pattern=pattern):
-                    self.assertEqual(bool(re.search(regex, host)), host in hits)
 
-    def test_missing_file_stops_before_output(self):
-        (self.source / "non_ip/microsoft_cdn.list").unlink()
-        with self.assertRaisesRegex(ValueError, r"microsoft_cdn\.list: cannot read input"):
-            convert.convert(self.source, self.data)
-        self.assertFalse(self.data.exists())
+def read_rules(path: Path, domainset: bool) -> list[str]:
+    try:
+        raw = path.read_bytes()
+    except OSError as exc:
+        raise ValueError(f"{path}: cannot read input: {exc.strerror}") from exc
+    try:
+        lines = raw.decode("utf-8-sig").splitlines()
+    except UnicodeDecodeError as exc:
+        number = raw.count(b"\n", 0, exc.start) + 1
+        raise ValueError(f"{path}:{number}: invalid UTF-8") from exc
 
-    def test_empty_file_stops_before_output(self):
-        (self.source / "non_ip/microsoft_cdn.list").write_text("# empty\n", encoding="utf-8")
-        with self.assertRaisesRegex(ValueError, r"microsoft_cdn\.list: no rules found"):
-            convert.convert(self.source, self.data)
-        self.assertFalse(self.data.exists())
+    rules = []
+    for number, raw_line in enumerate(lines, 1):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        try:
+            rules.append(convert_line(line, domainset))
+        except ValueError as exc:
+            raise ValueError(f"{path}:{number}: {exc}") from exc
+    if not rules:
+        raise ValueError(f"{path}: no rules found")
+    return rules
 
-    def test_bad_rules_report_source_line(self):
-        bad = {
-            "IP-CIDR,192.0.2.0/24": "unsupported rule type",
-            "DOMAIN,example..net": "invalid domain",
-            "DOMAIN,example.net,PROXY": "expected exactly",
-        }
-        for line, message in bad.items():
-            with self.subTest(line=line):
-                path = self.source / "non_ip/download.list"
-                path.write_text("# comment\n\n" + line + "\n", encoding="utf-8")
-                with self.assertRaisesRegex(ValueError, rf"download\.list:3: {message}"):
-                    convert.convert(self.source, self.data)
-                self.assertFalse(self.data.exists())
+
+def convert(source: Path, output: Path) -> dict:
+    categories = {}
+    counts = {}
+    for category, paths in SOURCES.items():
+        rules = set()
+        for relative in paths:
+            entries = read_rules(source / relative, relative.startswith("domainset/"))
+            counts[f"mihomo/{relative}"] = len(entries)
+            rules.update(entries)
+        categories[category] = sorted(rules)
+
+    # Do not let leftover files in a reused directory become extra GeoSite tags.
+    output.mkdir(parents=True)
+    for category, rules in categories.items():
+        (output / category).write_text("\n".join(rules) + "\n", encoding="utf-8", newline="\n")
+    return {
+        "inputs": counts,
+        "categories": {category: len(rules) for category, rules in categories.items()},
+    }
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--source", type=Path, required=True, help="path to Rules/mihomo")
+    parser.add_argument("--output", type=Path, required=True, help="new directory for DLC input")
+    args = parser.parse_args()
+    try:
+        summary = convert(args.source, args.output)
+    except (OSError, ValueError) as exc:
+        parser.exit(1, f"{exc}\n")
+    print(json.dumps(summary, indent=2))
+
+
+if __name__ == "__main__":
+    main()
