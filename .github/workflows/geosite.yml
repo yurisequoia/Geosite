@@ -71,7 +71,14 @@ jobs:
           go run -mod=readonly ./ --datapath="$BUILD_DIR/data" --outputdir="$BUILD_DIR/dist" --outputname=geosite.dat
           test -s "$BUILD_DIR/dist/geosite.dat"
 
+      - name: Compare with the latest release
+        id: comparison
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/check_release.py --repository "$GITHUB_REPOSITORY" --file "$BUILD_DIR/dist/geosite.dat"
+
       - name: Write the checksum and release metadata
+        if: steps.comparison.outputs.publish == 'true'
         id: release
         run: |
           rules_sha=$(git -C .work/rules rev-parse HEAD)
@@ -83,6 +90,7 @@ jobs:
           printf 'tag=%s\nsource_sha=%s\ndata_digest=%s\n' "$tag" "$rules_sha" "$data_digest" >> "$GITHUB_OUTPUT"
 
       - name: Publish GitHub Release
+        if: steps.comparison.outputs.publish == 'true'
         uses: softprops/action-gh-release@v3.0.4
         with:
           tag_name: ${{ steps.release.outputs.tag }}
